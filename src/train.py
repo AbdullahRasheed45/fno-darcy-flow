@@ -1,24 +1,30 @@
-"""Train an FNO surrogate for Darcy flow, single-GPU or distributed.
+"""Train an FNO surrogate for Darcy flow: single-GPU, DDP, or FSDP.
 
 Single GPU / CPU:
     python -m src.train --data data/darcy_train.npz
 
-Multi-GPU (DistributedDataParallel), e.g. 2 GPUs on one node:
+Data-parallel (DDP) across 2 GPUs on one node:
     torchrun --standalone --nproc_per_node=2 -m src.train --data data/darcy_train.npz
+
+Sharded (FSDP / ZeRO-3) across 2 GPUs -- shards params, grads, and optimizer
+state so a model too large for one GPU still fits:
+    torchrun --standalone --nproc_per_node=2 -m src.train \
+        --data data/darcy_train.npz --parallel fsdp
 
 The script detects a distributed launch via environment variables (RANK /
 WORLD_SIZE), so it runs identically under `torchrun` or under the manual
-process-spawning launcher in `src/benchmark.py` -- no code changes between
-single- and multi-GPU modes. Metrics reported: relative L2 error (the
-standard neural-operator benchmark metric) plus throughput (samples/s).
+process-spawning launcher in `src/benchmark.py`. Reports relative-L2 error,
+throughput (samples/s), and peak GPU memory per rank.
 """
 
 from __future__ import annotations
 
 import argparse
+import functools
 import json
 import os
 import time
+from contextlib import nullcontext
 from pathlib import Path
 
 import numpy as np
@@ -28,7 +34,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, TensorDataset, random_split
 from torch.utils.data.distributed import DistributedSampler
 
-from src.models.fno import FNO2d
+from src.models.fno import FNO2d, FNOBlock
 
 
 def relative_l2(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
@@ -63,6 +69,53 @@ def setup_distributed() -> tuple[int, int, torch.device]:
     return 0, 1, device
 
 
+def wrap_parallel(model: torch.nn.Module, parallel: str, world: int, device: torch.device):
+    """Wrap the model for the chosen parallelism. Returns the (possibly wrapped) model.
+
+    - ddp:  full replica per rank, gradients all-reduced each step (data parallel).
+    - fsdp: params/grads/optimizer-state sharded across ranks (ZeRO-3), all-gathered
+            layer-by-layer during forward/backward -- trades communication for memory,
+            so a model too big to replicate still fits.
+    """
+    if world == 1:
+        return model  # nothing to shard/replicate on a single process
+    if parallel == "ddp":
+        return DDP(model, device_ids=[device.index] if device.type == "cuda" else None)
+    if parallel == "fsdp":
+        from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+        from torch.distributed.fsdp.wrap import size_based_auto_wrap_policy
+        # Wrap each sizeable submodule (e.g. every FNOBlock) as its own FSDP unit so
+        # only one block's full parameters are materialised at a time.
+        policy = functools.partial(size_based_auto_wrap_policy, min_num_params=20_000)
+        kwargs = {"auto_wrap_policy": policy}
+        if device.type == "cuda":
+            kwargs["device_id"] = device.index
+        return FSDP(model, **kwargs)
+    raise ValueError(f"unknown --parallel {parallel!r}")
+
+
+def make_scaler(parallel: str, amp: bool, device: torch.device):
+    """AMP gradient scaler. FSDP needs the sharded variant (grads live in shards)."""
+    enabled = amp and device.type == "cuda"
+    if parallel == "fsdp" and enabled:
+        from torch.distributed.fsdp.sharded_grad_scaler import ShardedGradScaler
+        return ShardedGradScaler(enabled=True)
+    return torch.amp.GradScaler(enabled=enabled)
+
+
+def gather_state_dict(model, parallel: str, world: int) -> dict:
+    """Collective: assemble a full (unsharded) state dict on rank 0. All ranks must call."""
+    if parallel == "fsdp" and world > 1:
+        from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+        from torch.distributed.fsdp import FullStateDictConfig, StateDictType
+        cfg = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
+        with FSDP.state_dict_type(model, StateDictType.FULL_STATE_DICT, cfg):
+            return model.state_dict()
+    if world > 1:
+        return model.module.state_dict()
+    return model.state_dict()
+
+
 def load_data(path: Path) -> tuple[TensorDataset, TensorDataset, dict]:
     raw = np.load(path)
     a = torch.from_numpy(raw["a"]).float()
@@ -86,7 +139,11 @@ def main() -> None:
     p = argparse.ArgumentParser()
     p.add_argument("--data", type=Path, required=True)
     p.add_argument("--epochs", type=int, default=100)
-    p.add_argument("--batch-size", type=int, default=16, help="per-process batch size")
+    p.add_argument("--batch-size", type=int, default=16, help="per-process micro-batch size")
+    p.add_argument("--grad-accum", type=int, default=1,
+                   help="micro-batches per optimizer step (raises effective batch without memory)")
+    p.add_argument("--parallel", choices=["ddp", "fsdp"], default="ddp",
+                   help="multi-GPU strategy: ddp (replicate) or fsdp (shard/ZeRO-3)")
     p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--modes", type=int, default=12)
     p.add_argument("--width", type=int, default=32)
@@ -102,6 +159,7 @@ def main() -> None:
     torch.manual_seed(args.seed)
     rank, world, device = setup_distributed()
     is_main = rank == 0
+    accum = max(1, args.grad_accum)
 
     train_ds, val_ds, stats = load_data(args.data)
     train_sampler = DistributedSampler(train_ds) if world > 1 else None
@@ -112,17 +170,20 @@ def main() -> None:
 
     model = FNO2d(modes=args.modes, width=args.width, layers=args.layers).to(device)
     n_params = sum(p.numel() for p in model.parameters())
-    if world > 1:
-        model = DDP(model, device_ids=[device.index] if device.type == "cuda" else None)
+    model = wrap_parallel(model, args.parallel, world, device)
 
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=args.epochs)
-    scaler = torch.amp.GradScaler(enabled=args.amp and device.type == "cuda")
+    scaler = make_scaler(args.parallel, args.amp, device)
+    if device.type == "cuda":
+        torch.cuda.reset_peak_memory_stats(device)
 
+    effective_batch = args.batch_size * world * accum
     if is_main:
         print(f"model: FNO2d(modes={args.modes}, width={args.width}, layers={args.layers})  "
-              f"params={n_params:,}  world={world}  device={device.type}  "
-              f"global_batch={args.batch_size * world}")
+              f"params={n_params:,}  world={world}  parallel={args.parallel}  "
+              f"device={device.type}  micro_batch={args.batch_size}  "
+              f"grad_accum={accum}  effective_batch={effective_batch}")
 
     epoch_times: list[float] = []
     last_train, last_val = float("nan"), float("nan")
@@ -131,15 +192,24 @@ def main() -> None:
             train_sampler.set_epoch(epoch)  # reshuffle differently each epoch across ranks
         model.train()
         t0, train_loss, n_batches, local_samples = time.time(), 0.0, 0, 0
-        for a, u in train_dl:
+        opt.zero_grad(set_to_none=True)
+        n_steps = len(train_dl)
+        for i, (a, u) in enumerate(train_dl):
             a, u = a.to(device, non_blocking=True), u.to(device, non_blocking=True)
-            opt.zero_grad(set_to_none=True)
-            with torch.autocast(device.type, enabled=scaler.is_enabled()):
-                loss = relative_l2(model(a), u)
-            scaler.scale(loss).backward()
-            scaler.step(opt)
-            scaler.update()
-            train_loss += loss.item()
+            step_now = ((i + 1) % accum == 0) or (i + 1 == n_steps)
+            # During accumulation, skip the DDP/FSDP gradient sync on non-step
+            # micro-batches (no_sync) so we all-reduce once per optimizer step, not per micro-batch.
+            sync_ctx = (model.no_sync() if (world > 1 and not step_now and hasattr(model, "no_sync"))
+                        else nullcontext())
+            with sync_ctx:
+                with torch.autocast(device.type, enabled=scaler.is_enabled()):
+                    raw = relative_l2(model(a), u)
+                scaler.scale(raw / accum).backward()
+            if step_now:
+                scaler.step(opt)
+                scaler.update()
+                opt.zero_grad(set_to_none=True)
+            train_loss += raw.item()
             n_batches += 1
             local_samples += a.shape[0]
         sched.step()
@@ -167,35 +237,49 @@ def main() -> None:
             print(f"epoch {epoch + 1:3d}/{args.epochs}  "
                   f"train relL2 {last_train:.4f}  "
                   f"val relL2 {last_val:.4f}  "
-                  f"{epoch_dt:.2f}s  {throughput:,.0f} samples/s  world={world}")
+                  f"{epoch_dt:.2f}s  {throughput:,.0f} samples/s  "
+                  f"{args.parallel}/world={world}")
 
-    # Mean epoch time excludes epoch 0 (warm-up: allocator, cuDNN autotune, DDP buckets).
+    # Mean epoch time excludes epoch 0 (warm-up: allocator, cuDNN autotune, comm buckets).
     mean_epoch = float(np.mean(epoch_times[1:])) if len(epoch_times) > 1 else epoch_times[0]
-    total_samples = len(train_ds)
-    throughput_mean = total_samples / mean_epoch
+    throughput_mean = len(train_ds) / mean_epoch
+
+    # Peak memory: the headline FSDP metric. Report the worst rank (all-reduce MAX).
+    if device.type == "cuda":
+        peak = torch.tensor(float(torch.cuda.max_memory_allocated(device)), device=device)
+        if world > 1:
+            dist.all_reduce(peak, op=dist.ReduceOp.MAX)
+        peak_mem_mb = peak.item() / 1e6
+    else:
+        peak_mem_mb = None
+
+    state = gather_state_dict(model, args.parallel, world)  # collective: all ranks call
 
     if is_main:
         args.out.parent.mkdir(parents=True, exist_ok=True)
-        state = model.module.state_dict() if world > 1 else model.state_dict()
         torch.save({
             "model": state,
             "config": {"modes": args.modes, "width": args.width, "layers": args.layers},
             "stats": stats,
         }, args.out)
         print(f"saved {args.out}")
+        mem_str = f"  peak mem/rank {peak_mem_mb:,.0f} MB" if peak_mem_mb else ""
         print(f"mean epoch time (excl. warm-up): {mean_epoch:.3f}s  "
-              f"({throughput_mean:,.0f} samples/s global)")
+              f"({throughput_mean:,.0f} samples/s global){mem_str}")
 
         if args.metrics_out is not None:
             metrics = {
                 "world_size": world,
+                "parallel": args.parallel,
                 "device": device.type,
                 "epochs": args.epochs,
                 "per_rank_batch_size": args.batch_size,
-                "global_batch_size": args.batch_size * world,
+                "grad_accum": accum,
+                "effective_batch_size": effective_batch,
                 "model_params": n_params,
                 "mean_epoch_time_s": mean_epoch,
                 "throughput_samples_per_s": throughput_mean,
+                "peak_mem_mb": peak_mem_mb,
                 "final_train_relL2": last_train,
                 "final_val_relL2": last_val,
             }
