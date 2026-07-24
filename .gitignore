@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
+.DS_Store
+data/
+checkpoints/
+scaling.md
+# keep docs/prediction.png committed as a portfolio artifact
