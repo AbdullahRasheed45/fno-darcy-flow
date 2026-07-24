@@ -28,15 +28,22 @@ class SpectralConv2d(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         b, _, h, w = x.shape
-        x_ft = torch.fft.rfft2(x)
-        out_ft = torch.zeros(b, self.out_ch, h, w // 2 + 1, dtype=torch.cfloat, device=x.device)
-        out_ft[:, :, : self.modes1, : self.modes2] = self._mul(
-            x_ft[:, :, : self.modes1, : self.modes2], self.w1
-        )
-        out_ft[:, :, -self.modes1 :, : self.modes2] = self._mul(
-            x_ft[:, :, -self.modes1 :, : self.modes2], self.w2
-        )
-        return torch.fft.irfft2(out_ft, s=(h, w))
+        # FFTs and complex matmuls must run in fp32: under AMP autocast the input
+        # would be fp16, making rfft2 yield ComplexHalf, for which CUDA has no
+        # complex-einsum (baddbmm) kernel. Disable autocast and cast to float so
+        # the spectral path stays fp32 while AMP still accelerates the rest of the net.
+        with torch.autocast(device_type=x.device.type, enabled=False):
+            x = x.float()
+            x_ft = torch.fft.rfft2(x)
+            out_ft = torch.zeros(b, self.out_ch, h, w // 2 + 1,
+                                 dtype=torch.cfloat, device=x.device)
+            out_ft[:, :, : self.modes1, : self.modes2] = self._mul(
+                x_ft[:, :, : self.modes1, : self.modes2], self.w1
+            )
+            out_ft[:, :, -self.modes1 :, : self.modes2] = self._mul(
+                x_ft[:, :, -self.modes1 :, : self.modes2], self.w2
+            )
+            return torch.fft.irfft2(out_ft, s=(h, w))
 
 
 class FNOBlock(nn.Module):

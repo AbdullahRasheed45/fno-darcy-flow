@@ -20,3 +20,13 @@ def test_fno_backward():
     loss = model(torch.randn(2, 32, 32)).pow(2).mean()
     loss.backward()
     assert all(p.grad is not None for p in model.parameters() if p.requires_grad)
+
+
+def test_fno_forward_under_autocast():
+    """Regression: the spectral layer must run under AMP autocast without hitting
+    an unsupported complex-half kernel. Mirrors the --amp training path."""
+    model = FNO2d(modes=8, width=16, layers=2)
+    with torch.autocast(device_type="cpu", enabled=True):
+        out = model(torch.randn(2, 32, 32))
+    assert out.shape == (2, 32, 32)
+    assert torch.isfinite(out).all()
