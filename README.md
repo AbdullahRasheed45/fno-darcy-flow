@@ -95,18 +95,25 @@ python -m src.benchmark --data data/darcy_train.npz --gpus 1,2 --size large --am
 Measured on Kaggle **2× Tesla T4**, 1200 samples at 64×64, 100 epochs, AMP,
 per-GPU batch 16:
 
-| Setup | GPUs | epoch time (s) | throughput (samples/s) | val relL2 | speed-up |
-|-------|------|----------------|------------------------|-----------|----------|
-| 1× GPU | 1 | 1.17 | 924 | 0.0144 | 1.00× |
-| 2× GPU (DDP) | 2 | 0.75 | 1,431 | 0.0167 | 1.55× |
+| Strategy | GPUs | epoch time (s) | throughput (samples/s) | peak mem/GPU (MB) | val relL2 | speed-up |
+|----------|------|----------------|------------------------|-------------------|-----------|----------|
+| single GPU | 1 | 1.14 | 951 | 192 | 0.0144 | 1.00× |
+| DDP ×2 | 2 | 0.77 | 1,411 | 202 | 0.0167 | 1.48× |
 
-**Scaling analysis.** Two GPUs give a **1.55× throughput speed-up** (epoch time
-1.17s → 0.75s) — sub-linear, and honestly so. The model is small (2.4M params)
-and each epoch is only ~1s, so the per-step NCCL gradient all-reduce and the
-fixed DDP overhead are a non-trivial fraction of the step; there simply isn't
-enough compute per GPU to fully hide communication at this size. Larger models
-or higher resolution (e.g. `--width 64 --modes 24`, or 128×128 data) push the
+**Scaling analysis.** Two GPUs give a **~1.5× throughput speed-up** (epoch time
+1.14s → 0.77s; repeat runs on shared Kaggle hardware land between 1.48× and
+1.55×) — sub-linear, and honestly so. The model is small (2.4M params) and each
+epoch is only ~1s, so the per-step NCCL gradient all-reduce and the fixed DDP
+overhead are a non-trivial fraction of the step; there simply isn't enough
+compute per GPU to fully hide communication at this size. Larger models or
+higher resolution (`--size large`, or 128×128 data) push the
 compute/communication ratio up and the speed-up toward linear.
+
+**Note the memory column: DDP does not reduce per-GPU memory** (192 → 202 MB;
+the small rise is comm buffers). That is the defining limitation of data
+parallelism — every rank holds a *full* replica, so a model that OOMs on one GPU
+OOMs on all of them. Sharding (`--parallel fsdp`) is the answer to that problem,
+and the reason both strategies are implemented here.
 
 The 2-GPU val error is slightly higher (0.0167 vs 0.0144) because DDP **doubles
 the effective batch** (16 → 32) while epochs are held fixed, so the model takes
