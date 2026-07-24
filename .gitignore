@@ -8,4 +8,5 @@ __pycache__/
 /checkpoints/
 /scaling.md
 /scaling_memory.md
+/crossover.md
 # keep docs/prediction.png committed as a portfolio artifact

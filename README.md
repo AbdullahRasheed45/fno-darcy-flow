@@ -128,6 +128,33 @@ the sub-linear speed-up *and* the accuracy gap is the point of the exercise — 
 > runs on macOS/CPU for local testing, where `torchrun --standalone` can hang on
 > IPv6 loopback rendezvous.
 
+## The memory crossover: where DDP fails and FSDP doesn't
+
+Throughput speed-ups are the *easy* part of distributed training. The result that
+actually justifies sharding is the point where data parallelism **cannot run the
+job at all**:
+
+```bash
+python -m src.crossover --data data/darcy_train.npz --widths 64,128,192,256 --amp
+```
+
+The sweep grows the model until DDP runs out of memory on each GPU, while FSDP —
+holding only a *shard* of the parameters, gradients and optimizer state per rank
+— keeps training. It writes `crossover.md` and `docs/crossover.png`:
+
+| Model width | Params | DDP (replicated) | FSDP (sharded) |
+|-------------|--------|------------------|----------------|
+| 64 | … | ✅ … MB | ✅ … MB |
+| 256 | … | ❌ **OOM** | ✅ … MB |
+
+An OOM here is a **recorded data point, not a crash** — the harness distinguishes
+a genuine `torch.OutOfMemoryError` from an ordinary bug, so a broken run can
+never be mistaken for a memory limit (there are tests for exactly that).
+
+Why this is the headline: DDP's per-GPU memory does not fall as you add GPUs
+(see the 192 → 202 MB column above), so scaling *out* never fixes a model that
+doesn't fit. Sharding is the only thing that does.
+
 ## Design decisions (and why)
 
 The questions a reviewer will ask, answered:
@@ -219,6 +246,7 @@ src/data/darcy.py    # GRF sampling + finite-volume Darcy solver + dataset gener
 src/models/fno.py    # SpectralConv2d / FNO2d
 src/train.py         # DDP + FSDP training loop, AMP, grad accumulation, metrics JSON
 src/benchmark.py     # scaling across world sizes & strategies -> table + plot
+src/crossover.py     # grows the model until DDP OOMs and FSDP still trains
 src/infer.py         # eval a checkpoint + render prediction/ground-truth/error figure
 tests/               # solver, model, training, and distributed (multi-rank) tests
 notebooks/           # ready-to-run Kaggle 2x T4 benchmark notebook
