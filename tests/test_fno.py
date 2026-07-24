@@ -30,3 +30,25 @@ def test_fno_forward_under_autocast():
         out = model(torch.randn(2, 32, 32))
     assert out.shape == (2, 32, 32)
     assert torch.isfinite(out).all()
+
+
+def test_no_complex_parameters():
+    """Regression: AMP's GradScaler cannot unscale complex gradients on CUDA, so
+    every learnable parameter must be real-dtyped (complex weights are stored as
+    real [.., 2] tensors and reassembled with view_as_complex in forward)."""
+    model = FNO2d(modes=8, width=16, layers=2)
+    assert not any(p.is_complex() for p in model.parameters())
+
+
+def test_amp_optimizer_step():
+    """Regression for the GradScaler complex-gradient crash: a full
+    autocast -> scale -> unscale/step -> update cycle must complete."""
+    model = FNO2d(modes=8, width=16, layers=2)
+    opt = torch.optim.AdamW(model.parameters(), lr=1e-3)
+    scaler = torch.amp.GradScaler(device="cpu", enabled=True)
+    with torch.autocast(device_type="cpu", enabled=True):
+        loss = model(torch.randn(2, 32, 32)).pow(2).mean()
+    scaler.scale(loss).backward()
+    scaler.step(opt)      # calls unscale_ over all params — would raise on complex grads
+    scaler.update()
+    assert all(torch.isfinite(p).all() for p in model.parameters())

@@ -18,13 +18,19 @@ class SpectralConv2d(nn.Module):
         self.in_ch, self.out_ch = in_ch, out_ch
         self.modes1, self.modes2 = modes1, modes2
         scale = 1.0 / (in_ch * out_ch)
-        self.w1 = nn.Parameter(scale * torch.randn(in_ch, out_ch, modes1, modes2, dtype=torch.cfloat))
-        self.w2 = nn.Parameter(scale * torch.randn(in_ch, out_ch, modes1, modes2, dtype=torch.cfloat))
+        # Complex weights are stored as REAL tensors with a trailing [real, imag]
+        # dimension, and reassembled with view_as_complex() in forward. Reason:
+        # AMP's GradScaler unscales gradients with a CUDA kernel that is not
+        # implemented for complex dtypes; keeping the *parameters* real lets full
+        # fp16 mixed precision work, while the spectral math is still complex.
+        self.w1 = nn.Parameter(scale * torch.randn(in_ch, out_ch, modes1, modes2, 2))
+        self.w2 = nn.Parameter(scale * torch.randn(in_ch, out_ch, modes1, modes2, 2))
 
     @staticmethod
     def _mul(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
-        # (batch, in_ch, x, y) x (in_ch, out_ch, x, y) -> (batch, out_ch, x, y)
-        return torch.einsum("bixy,ioxy->boxy", x, w)
+        # x: complex (batch, in_ch, x, y); w: real (in_ch, out_ch, x, y, 2)
+        # -> complex (batch, out_ch, x, y)
+        return torch.einsum("bixy,ioxy->boxy", x, torch.view_as_complex(w))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         b, _, h, w = x.shape
