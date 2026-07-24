@@ -129,25 +129,33 @@ def format_table(rows: list[dict]) -> str:
     return "\n".join(lines)
 
 
-def make_plot(rows: list[dict], out: Path) -> None:
+def make_plot(rows: list[dict], out: Path, mem_limit_mb: float | None = None) -> None:
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
-    fig, ax = plt.subplots(figsize=(7, 4.5))
+    fig, ax = plt.subplots(figsize=(7.5, 4.8))
     for mode, colour in (("ddp", "tab:blue"), ("fsdp", "tab:orange")):
         ok = [r for r in rows if r["parallel"] == mode and r["status"] == "ok" and r["peak_mem_mb"]]
         if ok:
             ok.sort(key=lambda r: r["width"])
             ax.plot([r["width"] for r in ok], [r["peak_mem_mb"] for r in ok],
                     "o-", color=colour, label=mode.upper())
+    # The GPU's capacity is what makes an OOM legible: it's the line DDP crosses.
+    if mem_limit_mb:
+        ax.axhline(mem_limit_mb, ls="--", color="crimson", alpha=0.8)
+        ax.annotate(f"GPU memory limit ({mem_limit_mb:,.0f} MB)",
+                    (ax.get_xlim()[0], mem_limit_mb), textcoords="offset points",
+                    xytext=(6, 5), fontsize=9, color="crimson")
+    top = ax.get_ylim()[1]
+    for mode, colour in (("ddp", "tab:blue"), ("fsdp", "tab:orange")):
         for r in rows:
             if r["parallel"] == mode and r["status"] == "oom":
-                ax.scatter([r["width"]], [ax.get_ylim()[1]], marker="X", s=140,
-                           color=colour, zorder=5)
-                ax.annotate(f"{mode.upper()} OOM", (r["width"], ax.get_ylim()[1]),
-                            textcoords="offset points", xytext=(0, -18),
-                            ha="center", fontsize=9, color=colour)
+                y = mem_limit_mb if mem_limit_mb else top
+                ax.scatter([r["width"]], [y], marker="X", s=180, color=colour, zorder=5)
+                ax.annotate(f"{mode.upper()} out of memory", (r["width"], y),
+                            textcoords="offset points", xytext=(-14, -22),
+                            ha="right", fontsize=9, fontweight="bold", color=colour)
     ax.set_xlabel("model width (channels)")
     ax.set_ylabel("peak memory per GPU (MB)")
     # Only claim an OOM in the title if one was actually observed.
@@ -211,7 +219,14 @@ def main() -> None:
     else:
         print("\nNo crossover yet — raise --widths (and/or --modes) until DDP OOMs.")
     try:
-        make_plot(rows, args.plot)
+        limit = None
+        try:  # annotate the card's capacity so an OOM is visually explained
+            import torch
+            if torch.cuda.is_available():
+                limit = torch.cuda.get_device_properties(0).total_memory / 1024 ** 2
+        except Exception:
+            pass
+        make_plot(rows, args.plot, mem_limit_mb=limit)
     except Exception as e:
         print(f"(plot skipped: {e})")
 

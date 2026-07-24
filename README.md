@@ -164,7 +164,8 @@ per GPU. Measured on **2× Tesla T4 (15,360 MB each)**, modes=24, micro-batch 4:
 | 64 | 37.8M | 925 MB | 452 MB | 2.05× |
 | 128 | 151.1M | 3,644 MB | 1,714 MB | 2.13× |
 | 192 | 339.9M | 8,176 MB | 3,593 MB | 2.28× |
-| 256 | 604.3M | **14,522 MB** (95% of the card) | 6,371 MB | 2.28× |
+| 256 | 604.3M | 14,522 MB (97% of the card) | 6,371 MB | 2.28× |
+| **320** | **944.2M** | ❌ **out of memory** | ✅ **9,941 MB** | — |
 
 ![peak GPU memory: DDP vs FSDP across model sizes](docs/crossover.png)
 
@@ -172,12 +173,17 @@ per GPU. Measured on **2× Tesla T4 (15,360 MB each)**, modes=24, micro-batch 4:
 close to the theoretical 2× for a 2-rank ZeRO-3 shard, confirming parameters,
 gradients *and* optimizer state are all being sharded rather than just one of them.
 
-At width 256 (604M params) DDP reached **14.5 GB of 15.4 GB — 95% utilisation —
-and survived with ~800 MB to spare**, so this sweep stopped just short of forcing
-an OOM. The trend is unambiguous: memory scales as width² (3,644/925 ≈ 4 = 2²;
-8,176/3,644 ≈ 2.24 ≈ 1.5²), so width 320 would need ~22.7 GB under DDP — well past
-the card — while FSDP would need ~10 GB and keep training. Rerun with
-`--widths 320` on a T4 to capture that OOM explicitly.
+**The crossover is at width 320 (944M parameters).** DDP runs out of memory
+outright — a replica of the model, its gradients and its Adam state cannot fit in
+a T4's 14.9 GB — while FSDP trains the same model in **9.9 GB per GPU**, because
+each rank only ever holds 1/2 of the parameters plus the one layer it is currently
+all-gathering. This is the case data parallelism cannot solve by adding GPUs:
+every DDP rank needs the *whole* model, so 2 GPUs, 8 GPUs or 64 GPUs all OOM
+identically. Sharding is what makes the model trainable at all.
+
+The approach to the wall is visible in the numbers: at width 256 DDP was already
+at 14.5 GB of 14.9 GB (**97% of the card**), and memory scales as width²
+(3,644/925 ≈ 4 = 2²; 8,176/3,644 ≈ 2.24 ≈ 1.5²).
 
 An OOM is treated as a **recorded data point, not a crash** — the harness
 distinguishes a genuine `torch.OutOfMemoryError` from an ordinary bug, so a broken
