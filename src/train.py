@@ -82,6 +82,12 @@ def wrap_parallel(model: torch.nn.Module, parallel: str, world: int, device: tor
     if parallel == "ddp":
         return DDP(model, device_ids=[device.index] if device.type == "cuda" else None)
     if parallel == "fsdp":
+        if device.type != "cuda":
+            raise RuntimeError(
+                "--parallel fsdp requires CUDA GPUs: FSDP shards parameters onto an "
+                "accelerator and torch refuses to initialise it on CPU. Use --parallel ddp "
+                "for CPU/single-GPU runs."
+            )
         from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
         from torch.distributed.fsdp.wrap import size_based_auto_wrap_policy
         # Wrap each sizeable submodule (e.g. every FNOBlock) as its own FSDP unit so

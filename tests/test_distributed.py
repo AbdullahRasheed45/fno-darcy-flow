@@ -21,6 +21,11 @@ REPO = Path(__file__).resolve().parents[1]
 IS_MAC = platform.system() == "Darwin"
 
 
+def _has_cuda() -> bool:
+    import torch
+    return torch.cuda.is_available()
+
+
 def _make_data(path, n=16, grid=16):
     rng = np.random.default_rng(0)
     np.savez(path,
@@ -68,7 +73,8 @@ def test_ddp_two_rank_training(tmp_path):
     assert np.isfinite(m["final_val_relL2"])
 
 
-@pytest.mark.skipif(IS_MAC, reason="FSDP device autodetect hits the Apple MPS backend on macOS; runs on Linux CI")
+@pytest.mark.skipif(not _has_cuda(), reason="FSDP requires a CUDA accelerator: torch raises "
+                                            "'FSDP needs a non-CPU accelerator device' on CPU")
 def test_fsdp_two_rank_training(tmp_path):
     """FSDP shards params/grads/optimizer state across 2 ranks and still trains + checkpoints."""
     data = tmp_path / "d.npz"
@@ -97,6 +103,21 @@ def test_grad_accum_raises_effective_batch(tmp_path):
     m = json.loads(metrics.read_text())
     assert m["grad_accum"] == 2
     assert m["effective_batch_size"] == m["per_rank_batch_size"] * m["world_size"] * 2
+
+
+def test_fsdp_on_cpu_raises_actionable_error():
+    """FSDP can't initialise on CPU; fail with a clear message, not torch's internal one."""
+    import torch
+    from src.train import wrap_parallel
+    with pytest.raises(RuntimeError, match="requires CUDA"):
+        wrap_parallel(torch.nn.Linear(4, 4), "fsdp", world=2, device=torch.device("cpu"))
+
+
+def test_unknown_parallel_strategy_rejected():
+    import torch
+    from src.train import wrap_parallel
+    with pytest.raises(ValueError):
+        wrap_parallel(torch.nn.Linear(4, 4), "nope", world=2, device=torch.device("cpu"))
 
 
 def _fake(world, parallel, tp, mem=None):
