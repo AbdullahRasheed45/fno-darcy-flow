@@ -3,8 +3,9 @@
 A machine-learning surrogate for **Darcy flow**: a Fourier Neural Operator (FNO)
 trained to map random permeability fields `a(x)` to pressure solutions `u(x)`
 of the PDE `-div(a grad u) = f`, replacing a numerical solver with fast
-neural inference. Training runs single-GPU or **multi-GPU with PyTorch
-DistributedDataParallel**, with no code changes between modes.
+neural inference. Training scales from one GPU to many with **PyTorch DDP**
+(data-parallel) or **FSDP / ZeRO-3** (sharded), plus gradient accumulation and
+mixed precision — with no code changes between modes.
 
 Why this problem: field-to-field operator learning on PDE data is the core
 workload behind AI-accelerated engineering simulation. The dataset here is
@@ -26,9 +27,13 @@ python -m src.data.darcy --n-samples 1200 --grid 64 --out data/darcy_train.npz
 # 2a. Train on a single GPU (or CPU)
 python -m src.train --data data/darcy_train.npz --epochs 100 --amp
 
-# 2b. Train on 2 GPUs with DDP
+# 2b. Train on 2 GPUs with DDP (data-parallel)
 torchrun --standalone --nproc_per_node=2 -m src.train \
     --data data/darcy_train.npz --epochs 100 --amp
+
+# 2c. Train sharded with FSDP (ZeRO-3) — for models too big to replicate
+torchrun --standalone --nproc_per_node=2 -m src.train \
+    --data data/darcy_train.npz --epochs 100 --amp --parallel fsdp
 
 # 3. Evaluate + render prediction figure
 python -m src.infer --checkpoint checkpoints/fno_darcy.pt --data data/darcy_train.npz
@@ -42,13 +47,49 @@ neural-operator benchmark metric. On 2× T4 GPUs this model reaches
 [GPU_GUIDE.md](GPU_GUIDE.md) and the ready-to-run
 [notebooks/kaggle_2xT4.ipynb](notebooks/kaggle_2xT4.ipynb).
 
+## Distributed training: what's implemented and when to use it
+
+Four independent knobs, because "distributed training" is not one technique —
+it's a set of trades between **speed**, **memory**, and **batch size**:
+
+| Technique | Flag | What it trades | Use it when |
+|-----------|------|----------------|-------------|
+| **DDP** (data parallel) | `--parallel ddp` | Replicates the model per GPU; all-reduces gradients each step | The model fits on one GPU and you want **speed**. Default. |
+| **FSDP** (ZeRO-3, sharded) | `--parallel fsdp` | Shards params, grads *and* optimizer state across ranks; all-gathers layer-by-layer during forward/backward | The model **doesn't fit** on one GPU. Buys memory, costs communication. |
+| **Gradient accumulation** | `--grad-accum N` | N micro-batches per optimizer step | You need a large **effective batch** but lack the memory for it. |
+| **Mixed precision** | `--amp` | fp16 compute with loss scaling | Always, on tensor-core GPUs — roughly halves memory and speeds up the FFTs. |
+
+Key implementation details worth reading the code for:
+
+- **FSDP wraps each `FNOBlock` as its own shard unit** (size-based auto-wrap), so
+  only one block's full parameters are materialised at a time — that's what makes
+  the memory saving real rather than nominal.
+- **Checkpointing under FSDP is a collective**: parameters live in shards, so
+  every rank must enter `FSDP.state_dict_type(FULL_STATE_DICT, rank0_only=True)`
+  to gather a single complete checkpoint on rank 0. Saving only on rank 0 without
+  the gather silently writes a shard.
+- **Gradient accumulation uses `no_sync()`** on non-step micro-batches. Without
+  it DDP all-reduces gradients on *every* micro-batch, so accumulation would
+  multiply communication instead of amortising it.
+- **AMP under FSDP needs `ShardedGradScaler`**, not the plain `GradScaler` —
+  gradients are sharded, so unscaling has to be shard-aware.
+- **FSDP requires a CUDA device.** Torch refuses to initialise it on CPU, so the
+  code raises an actionable error pointing at `--parallel ddp` instead.
+
 ## Scaling benchmark
 
 The whole point of the DDP work is a measured scaling result. One command runs
 the same training on 1 and 2 GPUs and emits the table:
 
 ```bash
-python -m src.benchmark --data data/darcy_train.npz --gpus 1,2 --epochs 100 --amp
+# throughput scaling curve (writes scaling.md + docs/scaling.png)
+python -m src.benchmark --data data/darcy_train.npz --gpus 1,2,4 --epochs 100 --amp
+
+# DDP vs FSDP at the same world size — compare peak memory per GPU
+python -m src.benchmark --data data/darcy_train.npz --gpus 2 --parallel ddp,fsdp --amp
+
+# compute-bound preset: scaling gets closer to linear as the model grows
+python -m src.benchmark --data data/darcy_train.npz --gpus 1,2 --size large --amp
 ```
 
 Measured on Kaggle **2× Tesla T4**, 1200 samples at 64×64, 100 epochs, AMP,
@@ -116,6 +157,21 @@ The questions a reviewer will ask, answered:
   average, and the sample count is all-reduced (`SUM`) for correct global
   throughput.
 
+- **How is FSDP different from DDP?** DDP keeps a **full replica** of the model
+  on every GPU — memory scales with the number of GPUs only in *activations*, not
+  parameters, so a model that doesn't fit on one GPU doesn't fit on eight. FSDP
+  (ZeRO-3) **shards** parameters, gradients, and optimizer state across ranks;
+  each layer's full weights are all-gathered just in time for its forward/backward
+  and freed immediately after. That cuts per-GPU memory roughly by the world size
+  at the cost of extra communication (all-gather + reduce-scatter instead of one
+  all-reduce). Rule of thumb: **DDP for speed when it fits, FSDP when it doesn't.**
+
+- **Why does gradient accumulation need `no_sync()`?** DDP hooks gradient
+  all-reduce onto `backward()`. If you accumulate over N micro-batches naively,
+  you pay N all-reduces per optimizer step — accumulation would *increase*
+  communication. `no_sync()` suppresses the sync on the first N−1 micro-batches so
+  gradients accumulate locally and reduce once, at the step.
+
 - **Why spectral convolutions / why is the FNO resolution-invariant?** An FNO
   layer multiplies the lowest Fourier modes of the input by learned complex
   weights (a global convolution), then inverse-transforms. Because it
@@ -138,10 +194,14 @@ python -m pytest -q
 
 - **Solver** (`test_darcy.py`): positivity, symmetry, and linearity of the
   discretisation (`u` scales inversely with permeability).
-- **Model** (`test_fno.py`): spectral-conv shapes, gradient flow, and
-  resolution invariance.
-- **Training** (`test_train.py`): an end-to-end single-process run of the loop,
-  checking it converges to a finite metric and writes a valid checkpoint.
+- **Model** (`test_fno.py`): spectral-conv shapes, gradient flow, resolution
+  invariance, and — as regressions for two real bugs — a forward pass under AMP
+  autocast and a full `GradScaler` step (complex weights previously broke both).
+- **Training** (`test_train.py`): end-to-end single-process run of the loop.
+- **Distributed** (`test_distributed.py`): a real **two-rank DDP** training run
+  (spawned subprocesses, gloo), gradient accumulation, the FSDP-on-CPU guard,
+  and table/plot rendering. The two-rank **FSDP** test runs only where CUDA is
+  available — torch refuses to initialise FSDP without an accelerator.
 
 CI runs the suite on every push.
 
@@ -150,10 +210,10 @@ CI runs the suite on every push.
 ```
 src/data/darcy.py    # GRF sampling + finite-volume Darcy solver + dataset generation
 src/models/fno.py    # SpectralConv2d / FNO2d
-src/train.py         # DDP-aware training loop, AMP, cosine LR, throughput + metrics JSON
-src/benchmark.py     # runs 1 vs N GPUs, emits the scaling table
+src/train.py         # DDP + FSDP training loop, AMP, grad accumulation, metrics JSON
+src/benchmark.py     # scaling across world sizes & strategies -> table + plot
 src/infer.py         # eval a checkpoint + render prediction/ground-truth/error figure
-tests/               # solver + model + training tests
+tests/               # solver, model, training, and distributed (multi-rank) tests
 notebooks/           # ready-to-run Kaggle 2x T4 benchmark notebook
 Dockerfile           # CUDA runtime image for cloud GPU boxes
 GPU_GUIDE.md         # how to run on Kaggle / DGX Spark / rented cloud

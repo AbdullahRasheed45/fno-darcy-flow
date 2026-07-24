@@ -72,8 +72,21 @@ Manual equivalent, if you'd rather run cells yourself:
 
 ```bash
 python -m src.data.darcy --n-samples 1200 --grid 64 --out data/darcy_train.npz
+
+# throughput scaling (table + plot)
 python -m src.benchmark --data data/darcy_train.npz --gpus 1,2 --epochs 100 --amp
+
+# DDP vs FSDP peak-memory comparison at the same world size
+python -m src.benchmark --data data/darcy_train.npz --gpus 2 --parallel ddp,fsdp \
+    --epochs 30 --size large --amp
 ```
+
+**Reading the FSDP result:** expect FSDP to be *slower* than DDP here and to use
+*less* peak memory per GPU. That is the correct outcome, not a failure — FSDP
+trades communication (all-gather + reduce-scatter per layer) for memory. Its
+value shows up when the model no longer fits under DDP at all: raise `--size
+large --width 128` until DDP OOMs and FSDP still runs. That crossover is the
+most convincing thing you can demonstrate about sharded training.
 
 ---
 
@@ -82,11 +95,16 @@ python -m src.benchmark --data data/darcy_train.npz --gpus 1,2 --epochs 100 --am
 Same commands as Kaggle; you just get faster/more GPUs (e.g. 2× or 4× A10/A100).
 
 ```bash
-git clone <your repo> && cd physics-surrogate-ddp
+git clone https://github.com/AbdullahRasheed45/fno-darcy-flow.git && cd fno-darcy-flow
 pip install -r requirements.txt
 python -m src.data.darcy --n-samples 1200 --grid 64 --out data/darcy_train.npz
-python -m src.benchmark --data data/darcy_train.npz --gpus 1,2,4 --epochs 100 --amp
+# a 4-GPU box turns the two-point comparison into a real scaling *curve*
+python -m src.benchmark --data data/darcy_train.npz --gpus 1,2,4 --size large --epochs 100 --amp
 ```
+
+A 1/2/4-GPU curve (with the ideal-linear reference line the benchmark plots) is
+substantially more convincing than a single 1-vs-2 number — it shows *where*
+scaling starts to fall off, which is the interesting engineering content.
 
 Or the Docker path (the repo's `Dockerfile` is CUDA-ready):
 

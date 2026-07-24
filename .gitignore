@@ -7,4 +7,5 @@ __pycache__/
 /data/
 /checkpoints/
 /scaling.md
+/scaling_memory.md
 # keep docs/prediction.png committed as a portfolio artifact
