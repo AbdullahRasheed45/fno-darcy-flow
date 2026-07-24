@@ -110,13 +110,25 @@ def make_scaler(parallel: str, amp: bool, device: torch.device):
 
 
 def gather_state_dict(model, parallel: str, world: int) -> dict:
-    """Collective: assemble a full (unsharded) state dict on rank 0. All ranks must call."""
+    """Collective: assemble a full (unsharded) state dict on rank 0. All ranks must call.
+
+    Under FSDP the parameters live in shards, so saving on rank 0 alone would write
+    a fragment; every rank has to participate in the gather.
+    """
     if parallel == "fsdp" and world > 1:
-        from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-        from torch.distributed.fsdp import FullStateDictConfig, StateDictType
-        cfg = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
-        with FSDP.state_dict_type(model, StateDictType.FULL_STATE_DICT, cfg):
-            return model.state_dict()
+        try:
+            # Current API (works across FSDP1/FSDP2/DDP).
+            from torch.distributed.checkpoint.state_dict import (
+                StateDictOptions, get_model_state_dict)
+            return get_model_state_dict(
+                model, options=StateDictOptions(full_state_dict=True, cpu_offload=True))
+        except Exception:
+            # Fall back to the legacy context manager on older torch.
+            from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+            from torch.distributed.fsdp import FullStateDictConfig, StateDictType
+            cfg = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
+            with FSDP.state_dict_type(model, StateDictType.FULL_STATE_DICT, cfg):
+                return model.state_dict()
     if world > 1:
         return model.module.state_dict()
     return model.state_dict()

@@ -115,6 +115,20 @@ parallelism — every rank holds a *full* replica, so a model that OOMs on one G
 OOMs on all of them. Sharding (`--parallel fsdp`) is the answer to that problem,
 and the reason both strategies are implemented here.
 
+### DDP vs FSDP, same model, same 2 GPUs
+
+Measured at the `large` preset (modes 24, width 64 — 37.8M params), 30 epochs:
+
+| Strategy | epoch time (s) | throughput (samples/s) | peak mem/GPU (MB) | val relL2 |
+|----------|----------------|------------------------|-------------------|-----------|
+| DDP ×2 | 4.63 | 233 | 925 | 0.0151 |
+| FSDP ×2 | 6.04 | 179 | **495** | 0.0151 |
+
+FSDP is **23% slower and uses 1.9× less memory, at bit-comparable accuracy**
+(0.0151 both) — the sharding trade in one table. The identical validation error is
+also the correctness check: an incorrectly sharded model would not reproduce the
+replicated one's loss curve step for step.
+
 The 2-GPU val error is slightly higher (0.0167 vs 0.0144) because DDP **doubles
 the effective batch** (16 → 32) while epochs are held fixed, so the model takes
 half as many optimizer steps — the classic large-batch effect. Training the
@@ -138,22 +152,34 @@ job at all**:
 python -m src.crossover --data data/darcy_train.npz --widths 64,128,192,256 --amp
 ```
 
-The sweep grows the model until DDP runs out of memory on each GPU, while FSDP —
-holding only a *shard* of the parameters, gradients and optimizer state per rank
-— keeps training. It writes `crossover.md` and `docs/crossover.png`:
+The sweep grows the model while running both strategies, measuring peak memory
+per GPU. Measured on **2× Tesla T4 (15,360 MB each)**, modes=24, micro-batch 4:
 
-| Model width | Params | DDP (replicated) | FSDP (sharded) |
-|-------------|--------|------------------|----------------|
-| 64 | … | ✅ … MB | ✅ … MB |
-| 256 | … | ❌ **OOM** | ✅ … MB |
+| Model width | Params | DDP (replicated) | FSDP (sharded) | FSDP saving |
+|-------------|--------|------------------|----------------|-------------|
+| 64 | 37.8M | 925 MB | 452 MB | 2.05× |
+| 128 | 151.1M | 3,644 MB | 1,714 MB | 2.13× |
+| 192 | 339.9M | 8,176 MB | 3,593 MB | 2.28× |
+| 256 | 604.3M | **14,522 MB** (95% of the card) | 6,371 MB | 2.28× |
 
-An OOM here is a **recorded data point, not a crash** — the harness distinguishes
-a genuine `torch.OutOfMemoryError` from an ordinary bug, so a broken run can
-never be mistaken for a memory limit (there are tests for exactly that).
+**FSDP consistently holds ~2.2× less memory per GPU at identical accuracy** — very
+close to the theoretical 2× for a 2-rank ZeRO-3 shard, confirming parameters,
+gradients *and* optimizer state are all being sharded rather than just one of them.
 
-Why this is the headline: DDP's per-GPU memory does not fall as you add GPUs
-(see the 192 → 202 MB column above), so scaling *out* never fixes a model that
-doesn't fit. Sharding is the only thing that does.
+At width 256 (604M params) DDP reached **14.5 GB of 15.4 GB — 95% utilisation —
+and survived with ~800 MB to spare**, so this sweep stopped just short of forcing
+an OOM. The trend is unambiguous: memory scales as width² (3,644/925 ≈ 4 = 2²;
+8,176/3,644 ≈ 2.24 ≈ 1.5²), so width 320 would need ~22.7 GB under DDP — well past
+the card — while FSDP would need ~10 GB and keep training. Rerun with
+`--widths 320` on a T4 to capture that OOM explicitly.
+
+An OOM is treated as a **recorded data point, not a crash** — the harness
+distinguishes a genuine `torch.OutOfMemoryError` from an ordinary bug, so a broken
+run can never be mistaken for a memory limit (there are tests for exactly that).
+
+Why this matters: DDP's per-GPU memory does not fall as you add GPUs (see the
+192 → 202 MB column above), so scaling *out* never fixes a model that doesn't fit.
+Sharding is the only thing that does.
 
 ## Design decisions (and why)
 
