@@ -102,6 +102,43 @@ def format_table(results: list[dict]) -> str:
     return "\n".join(lines)
 
 
+def _plot_strategy_bars(results: list[dict], out: Path) -> None:
+    """Single world size, several strategies: show the trade directly as bars.
+
+    A throughput-vs-GPU line would be a single x value here, which says nothing;
+    what matters when comparing DDP against FSDP is speed *and* memory side by side.
+    """
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    results = sorted(results, key=lambda r: r.get("parallel", ""))
+    labels = [r.get("parallel", "ddp").upper() for r in results]
+    tp = [r["throughput_samples_per_s"] for r in results]
+    mem = [r.get("peak_mem_mb") or 0 for r in results]
+    colours = ["tab:blue", "tab:orange", "tab:green"][: len(results)]
+
+    fig, axes = plt.subplots(1, 2, figsize=(9, 4.2))
+    for ax, vals, title, unit in (
+        (axes[0], tp, "Throughput (higher is better)", "samples/s"),
+        (axes[1], mem, "Peak memory per GPU (lower is better)", "MB"),
+    ):
+        ax.bar(labels, vals, color=colours)
+        ax.set_title(title, fontsize=11)
+        ax.set_ylabel(unit)
+        for i, v in enumerate(vals):
+            ax.annotate(f"{v:,.0f}", (i, v), ha="center",
+                        textcoords="offset points", xytext=(0, 4), fontsize=9)
+        ax.margins(y=0.15)
+        ax.grid(alpha=0.3, axis="y")
+    k = results[0]["world_size"]
+    fig.suptitle(f"DDP vs FSDP on {k} GPUs — sharding trades speed for memory")
+    fig.tight_layout()
+    out.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out, dpi=130)
+    print(f"wrote {out}")
+
+
 def make_plot(results: list[dict], out: Path) -> None:
     """Throughput vs GPU count, one line per strategy, against ideal linear scaling."""
     import matplotlib
@@ -111,6 +148,10 @@ def make_plot(results: list[dict], out: Path) -> None:
     by_mode: dict[str, list[dict]] = {}
     for r in results:
         by_mode.setdefault(r.get("parallel", "ddp"), []).append(r)
+
+    # Comparing strategies at one world size is a bar chart, not a scaling curve.
+    if len({r["world_size"] for r in results}) == 1 and len(by_mode) > 1:
+        return _plot_strategy_bars(results, out)
 
     fig, ax = plt.subplots(figsize=(7, 4.5))
     base = min(results, key=lambda r: r["world_size"])["throughput_samples_per_s"]

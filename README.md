@@ -97,8 +97,10 @@ per-GPU batch 16:
 
 | Strategy | GPUs | epoch time (s) | throughput (samples/s) | peak mem/GPU (MB) | val relL2 | speed-up |
 |----------|------|----------------|------------------------|-------------------|-----------|----------|
-| single GPU | 1 | 1.14 | 951 | 192 | 0.0144 | 1.00× |
-| DDP ×2 | 2 | 0.77 | 1,411 | 202 | 0.0167 | 1.48× |
+| single GPU | 1 | 1.13 | 954 | 192 | 0.0144 | 1.00× |
+| DDP ×2 | 2 | 0.76 | 1,429 | 202 | 0.0167 | 1.50× |
+
+![throughput scaling vs. ideal linear](docs/scaling.png)
 
 **Scaling analysis.** Two GPUs give a **~1.5× throughput speed-up** (epoch time
 1.14s → 0.77s; repeat runs on shared Kaggle hardware land between 1.48× and
@@ -123,6 +125,8 @@ Measured at the `large` preset (modes 24, width 64 — 37.8M params), 30 epochs:
 |----------|----------------|------------------------|-------------------|-----------|
 | DDP ×2 | 4.63 | 233 | 925 | 0.0151 |
 | FSDP ×2 | 6.04 | 179 | **495** | 0.0151 |
+
+![DDP vs FSDP: throughput and memory](docs/scaling_memory.png)
 
 FSDP is **23% slower and uses 1.9× less memory, at bit-comparable accuracy**
 (0.0151 both) — the sharding trade in one table. The identical validation error is
@@ -161,6 +165,8 @@ per GPU. Measured on **2× Tesla T4 (15,360 MB each)**, modes=24, micro-batch 4:
 | 128 | 151.1M | 3,644 MB | 1,714 MB | 2.13× |
 | 192 | 339.9M | 8,176 MB | 3,593 MB | 2.28× |
 | 256 | 604.3M | **14,522 MB** (95% of the card) | 6,371 MB | 2.28× |
+
+![peak GPU memory: DDP vs FSDP across model sizes](docs/crossover.png)
 
 **FSDP consistently holds ~2.2× less memory per GPU at identical accuracy** — very
 close to the theoretical 2× for a 2-rank ZeRO-3 shard, confirming parameters,

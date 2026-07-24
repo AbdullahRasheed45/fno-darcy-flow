@@ -150,7 +150,10 @@ def make_plot(rows: list[dict], out: Path) -> None:
                             ha="center", fontsize=9, color=colour)
     ax.set_xlabel("model width (channels)")
     ax.set_ylabel("peak memory per GPU (MB)")
-    ax.set_title("Where data parallelism runs out of memory and sharding doesn't")
+    # Only claim an OOM in the title if one was actually observed.
+    oomed = any(r["status"] == "oom" for r in rows)
+    ax.set_title("Where data parallelism runs out of memory and sharding doesn't" if oomed
+                 else "Peak GPU memory: replicated (DDP) vs sharded (FSDP)")
     ax.grid(alpha=0.3)
     if ax.get_legend_handles_labels()[1]:  # no labelled lines when nothing recorded memory
         ax.legend()
