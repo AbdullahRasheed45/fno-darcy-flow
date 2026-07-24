@@ -67,7 +67,8 @@ def run_world(k: int, args, metrics_path: Path) -> dict:
 
 
 def format_table(results: list[dict]) -> str:
-    base = results[0]["throughput_samples_per_s"]
+    # Speed-up is relative to the smallest world size that succeeded (normally 1 GPU).
+    base = min(results, key=lambda r: r["world_size"])["throughput_samples_per_s"]
     lines = [
         "| Setup | GPUs | epoch time (s) | throughput (samples/s) | val relL2 | speed-up |",
         "|-------|------|----------------|------------------------|-----------|----------|",
@@ -100,17 +101,26 @@ def main() -> None:
     worlds = [int(x) for x in args.gpus.split(",")]
     with tempfile.TemporaryDirectory() as tmp:
         args.workdir = tmp
-        results = []
+        results, failed = [], []
         for k in worlds:
             print(f"\n=== world_size = {k} ===", flush=True)
-            m = run_world(k, args, Path(tmp) / f"metrics_w{k}.json")
+            try:
+                m = run_world(k, args, Path(tmp) / f"metrics_w{k}.json")
+            except Exception as e:  # keep partial results if one config fails
+                print(f"  world_size={k} FAILED: {e}")
+                failed.append(k)
+                continue
             results.append(m)
             print(f"  epoch {m['mean_epoch_time_s']:.2f}s  "
                   f"{m['throughput_samples_per_s']:,.0f} samples/s  "
                   f"val relL2 {m['final_val_relL2']:.4f}")
 
+    if not results:
+        raise SystemExit("all benchmark runs failed — see errors above")
     table = format_table(results)
     print("\n" + table)
+    if failed:
+        print(f"\nNOTE: world sizes {failed} failed; table shows successful runs only.")
     args.out.write_text(table + "\n")
     print(f"\nwrote {args.out}")
 

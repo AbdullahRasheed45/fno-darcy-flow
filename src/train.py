@@ -147,7 +147,9 @@ def main() -> None:
         epoch_times.append(epoch_dt)
 
         # Global samples/s: sum the samples every rank processed, divide by wall time.
-        samples = torch.tensor(float(local_samples))
+        # The tensor must live on the compute device: NCCL collectives only operate
+        # on CUDA tensors (a CPU tensor raises "No backend type associated with cpu").
+        samples = torch.tensor(float(local_samples), device=device)
         if world > 1:
             dist.all_reduce(samples, op=dist.ReduceOp.SUM)
         throughput = samples.item() / epoch_dt
